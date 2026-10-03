@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { detect, splitCommand } from "./detect.js"
+import { detect, isInPlaceFlag, splitCommand } from "./detect.js"
 
 const blocked: [string, string][] = [
   ["inline -c open for write", `python3 -c "open('a.txt','w').write('x')"`],
@@ -52,6 +52,23 @@ const blocked: [string, string][] = [
     "env prefix before interpreter",
     `PYTHONPATH=. python3 -c "import shutil; shutil.move('a','b')"`,
   ],
+  ["sed -i", `sed -i 's/foo/bar/' src/app.ts`],
+  ["sed -i with backup suffix", `sed -i.bak 's/foo/bar/' src/app.ts`],
+  ["sed clustered flags", `sed -ni 's/foo/bar/p' src/app.ts`],
+  ["sed --in-place", `sed --in-place 's/foo/bar/' src/app.ts`],
+  ["sed via absolute path", `/usr/bin/sed -i 's/a/b/' f.txt`],
+  ["sed under sudo", `sudo sed -i 's/a/b/' /etc/hosts`],
+  ["sed under xargs", `printf 'a\\nb\\n' | xargs sed -i 's/a/b/'`],
+  ["sed under find -exec", `find . -name '*.tmp' -exec sed -i '' 's/a/b/' {} +`],
+  ["sed -i in a chained command", `cd app && sed -i 's/a/b/' f.txt && echo done`],
+  ["sed -i inside command substitution", `diff <(sed -i 's/a/b/' f.txt) f.txt.orig`],
+  ["sed -i in a subshell", `(sed -i 's/a/b/' f.txt)`],
+  ["sed -i after a python script run", `python3 build.py && sed -i 's/a/b/' out.py`],
+  ["sed -i in a for loop body", `for f in *.ts; do sed -i 's/a/b/' "$f"; done`],
+  ["sed -i in an if branch", `if grep -q x f; then sed -i 's/a/b/' f; fi`],
+  ["sed -i in a while body", `while read -r f; do sed -i 's/a/b/' "$f"; done < list.txt`],
+  ["sed -i in a background job", `sed -i 's/a/b/' f.txt &`],
+  ["python inside a loop body", `for f in *.py; do python3 -c "open('a','w')"; done`],
 ]
 
 const allowed: string[] = [
@@ -86,6 +103,14 @@ const allowed: string[] = [
   `python3 -c "import os; print(os.listdir('.'))"`,
   `python3 - <<'PY'\nimport json\nprint(json.dumps({'a': 1}))\nPY`,
   `python3 -c "print(open('f.txt').read().upper())"`,
+  `sed -n '1,20p' src/app.ts`,
+  `sed -e 's/foo/bar/' f.txt | diff - f.txt`,
+  `sed 's/foo/bar/g' README.md`,
+  `sed -f cleanup.sed f.txt`,
+  `grep -n 'foo' f.txt | sed 's/foo/bar/'`,
+  `echo "run sed -i 's/a/b/' to edit in place" >> notes.md`,
+  `sed --help`,
+  `sed -n '/def main/,$p' src/detect.ts > head.ts`,
 ]
 
 describe("blocked commands", () => {
@@ -134,5 +159,19 @@ describe("splitCommand", () => {
     const created = detect("python3 script.py 2>&1")
     expect(created).toBeNull()
     expect(segments[0]!.redirects.map((r) => r.target)).toContain("1")
+  })
+})
+
+describe("isInPlaceFlag", () => {
+  test("accepts the in-place forms", () => {
+    for (const flag of ["-i", "-i.bak", "-i''", "-ni", "-Ei", "--in-place", "--in-place=.bak"]) {
+      expect(isInPlaceFlag(flag), flag).toBe(true)
+    }
+  })
+
+  test("rejects flags that only look in-place", () => {
+    for (const flag of ["-n", "-f", "-e", "-fsed.sed", "-eimport", "-I", "--quiet", "-", "--", "i"]) {
+      expect(isInPlaceFlag(flag), flag).toBe(false)
+    }
   })
 })

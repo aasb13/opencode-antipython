@@ -11,6 +11,9 @@
  *   3. classify      - decide whether the payload is a real script, a module
  *                      run, or inline code authored by the model
  *   4. scanCode      - regex edit-intent scan over inline code
+ *
+ * The same policy covers `sed -i`: any in-place rewrite of a file is off
+ * limits, not just the ones routed through an interpreter.
  */
 
 export type Violation = {
@@ -21,7 +24,7 @@ export type Violation = {
   /** the offending code, trimmed for the error message */
   excerpt: string
   /** how the code reached the interpreter */
-  via: "inline-c" | "heredoc-stdin" | "pipe-stdin" | "here-string" | "generated-script"
+  via: "inline-c" | "heredoc-stdin" | "pipe-stdin" | "here-string" | "generated-script" | "in-place-sed"
 }
 
 export type Segment = {
@@ -305,6 +308,33 @@ const RUNNERS = new Set([
   "pixi",
 ])
 
+/**
+ * Shell control words that may precede a command word. The splitter breaks a
+ * compound command at `;`, so a loop or conditional body arrives as its own
+ * segment starting with one of these.
+ */
+const CONTROL_WORDS = new Set([
+  "do",
+  "then",
+  "else",
+  "elif",
+  "if",
+  "while",
+  "until",
+  "for",
+  "in",
+  "case",
+  "esac",
+  "fi",
+  "done",
+  "time",
+  "coproc",
+  "select",
+  "function",
+  "not",
+  "return",
+])
+
 export function findPythonIndex(argv: string[]): number {
   for (let i = 0; i < argv.length; i++) {
     const word = argv[i]!
@@ -318,6 +348,7 @@ export function findPythonIndex(argv: string[]): number {
       if (RUNNERS.has(basename(prev)) || RUNNERS.has(prev)) continue
       if (/^-(?:[a-z]*n)?\d+$/.test(prev)) continue
       if (prev === "--") continue
+      if (CONTROL_WORDS.has(prev)) continue
       ok = false
       break
     }
@@ -329,6 +360,77 @@ export function findPythonIndex(argv: string[]): number {
 type Payload =
   | { kind: "allow"; why: string }
   | { kind: "inline"; code: string; via: Violation["via"] }
+
+const SED_BASENAMES = new Set(["sed", "gsed"])
+
+/**
+ * launchers that hand the rest of their argv to sed: `xargs`, and the find
+ * primaries (`-exec`/`-ok`, whose `rargs` companion may follow the command).
+ */
+const SED_LAUNCHERS = new Set(["xargs", "-exec", "-execdir", "-ok", "-okdir", "rargs"])
+
+export function isSedBinary(word: string): boolean {
+  return SED_BASENAMES.has(basename(word))
+}
+
+/**
+ * index of a sed invocation, or -1. Mirrors findPythonIndex: everything before
+ * the command word has to be a benign prefix (runner, env assignment, or a flag
+ * of a launcher like `xargs -0`).
+ */
+export function findSedIndex(argv: string[]): number {
+  for (let i = 0; i < argv.length; i++) {
+    const word = argv[i]!
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue
+    if (!isSedBinary(word)) continue
+    // find's `find . -name x -exec sed ...` needs the launcher rule, not a
+    // per-word allowlist: everything in between is find's own arguments.
+    if (argv.slice(0, i).some((w) => SED_LAUNCHERS.has(w))) return i
+    let ok = true
+    for (let j = 0; j < i; j++) {
+      const prev = argv[j]!
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(prev)) continue
+      if (RUNNERS.has(basename(prev)) || RUNNERS.has(prev)) continue
+      if (/^-[A-Za-z0-9][\w.-]*$/.test(prev)) continue
+      if (CONTROL_WORDS.has(prev)) continue
+      ok = false
+      break
+    }
+    if (ok) return i
+  }
+  return -1
+}
+
+/**
+ * Does this raw argv token switch sed to in-place mode?
+ *
+ * Matched against the unstripped token so a quoted word (`echo "sed -i"`) can
+ * never look like a flag. `-i`, clustered flags like `-ni` / `-Ei`, the GNU
+ * suffix form `-i.bak` and `--in-place` all count; `-f script` and
+ * `-e expr` do not, since their value swallows the rest of the cluster.
+ */
+export function isInPlaceFlag(token: string): boolean {
+  if (token === "--in-place" || token.startsWith("--in-place=")) return true
+  if (!/^-[^-]/.test(token)) return false
+  const cluster = token.slice(1).split(".")[0]!
+  for (const ch of cluster) {
+    if (ch === "i") return true
+    if (ch === "f" || ch === "e" || ch === "s") return false
+  }
+  return false
+}
+
+/** the in-place flag of a sed segment, or null when it only reads */
+function findInPlaceFlag(argv: string[]): string | null {
+  const index = findSedIndex(argv)
+  if (index < 0) return null
+  for (let i = index + 1; i < argv.length; i++) {
+    const token = argv[i]!
+    if (token === "--") break
+    if (isInPlaceFlag(token)) return token
+  }
+  return null
+}
 
 /** .py files the shell part of the command creates, with their inline content */
 function collectCreatedFiles(segments: Segment[]): Map<string, { content: string }> {
@@ -504,8 +606,27 @@ function excerpt(code: string): string {
 }
 
 export function detect(command: string): Violation | null {
-  if (!command || !/python|\bpy\b|pypy/i.test(command)) return null
+  if (!command) return null
+  const mentionsPython = /python|\bpy\b|pypy/i.test(command)
+  const mentionsSed = /\b(?:g?sed)\b/i.test(command)
+  if (!mentionsPython && !mentionsSed) return null
   const segments = splitCommand(command)
+
+  if (mentionsSed) {
+    for (const segment of segments) {
+      const flag = findInPlaceFlag(segment.argv)
+      if (!flag) continue
+      const invocation = segment.raw || segment.argv.join(" ")
+      return {
+        reason: `in-place replacement (${flag})`,
+        invocation,
+        excerpt: excerpt(invocation),
+        via: "in-place-sed",
+      }
+    }
+  }
+
+  if (!mentionsPython) return null
   const created = collectCreatedFiles(segments)
 
   for (let i = 0; i < segments.length; i++) {
