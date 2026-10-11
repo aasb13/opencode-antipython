@@ -69,6 +69,9 @@ const blocked: [string, string][] = [
   ["sed -i in a while body", `while read -r f; do sed -i 's/a/b/' "$f"; done < list.txt`],
   ["sed -i in a background job", `sed -i 's/a/b/' f.txt &`],
   ["python inside a loop body", `for f in *.py; do python3 -c "open('a','w')"; done`],
+  ["binary write", `python3 -c "open('a.bin','wb').write(b'x')"`],
+  ["mode kwarg", `python3 -c "open('a.txt', mode='w').write('x')"`],
+  ["pathlib open for write", `python3 -c "import pathlib; pathlib.Path('a').open('w').write('x')"`],
 ]
 
 const allowed: string[] = [
@@ -103,6 +106,10 @@ const allowed: string[] = [
   `python3 -c "import os; print(os.listdir('.'))"`,
   `python3 - <<'PY'\nimport json\nprint(json.dumps({'a': 1}))\nPY`,
   `python3 -c "print(open('f.txt').read().upper())"`,
+  `python3 -c "data = open('ConstantCipherTest.java','rb').read(); print(len(data))"`,
+  `python3 -c "d = open('a.json', encoding='utf-8').read(); print(len(d))"`,
+  `python3 -c "f = open('a.txt', mode='r'); print(f.read())"`,
+  `python3 -c "import pathlib; print(pathlib.Path('a.txt').open('r').read())"`,
   `sed -n '1,20p' src/app.ts`,
   `sed -e 's/foo/bar/' f.txt | diff - f.txt`,
   `sed 's/foo/bar/g' README.md`,

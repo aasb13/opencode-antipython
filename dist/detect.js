@@ -511,8 +511,118 @@ function stripQuotes(word) {
     }
     return word;
 }
+/**
+ * Does a file-mode string grant write access? Only `w`, `x`, `a` and `+`
+ * do; `r`, `b`, `t` and `U` alone are read-only. The charset guard keeps
+ * non-mode strings (paths, encodings like `utf-8`/`latin-1`) from matching.
+ */
+function isWriteMode(mode) {
+    if (!/^[rwxaUbt+]+$/.test(mode))
+        return false;
+    return /[wax+]/.test(mode);
+}
+/**
+ * True when any quoted literal inside the text is a file mode granting
+ * write access. Scans literals rather than the whole argument so a dynamic
+ * mode (`'w' if x else 'r'`) still blocks while `encoding='latin-1'` (not
+ * in the mode position) is never even examined.
+ */
+function hasWriteLiteral(text) {
+    const re = /"([^"]*)"|'([^']*)'/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        if (isWriteMode(m[1] ?? m[2] ?? ""))
+            return true;
+    }
+    return false;
+}
+/**
+ * True when the code opens a file for writing. Parses `open(...)` calls so
+ * read-only opens (`open(f)`, `open(f, 'r')`, `open(f, 'rb')`,
+ * `open(f, encoding='utf-8')`) stay allowed while `w`/`a`/`x`/`+` modes
+ * (positional or `mode=`) still block. A dotted call (`Path(p).open('w')`,
+ * `gzip.open(f, 'wt')`) checks both the first and second positional args
+ * since pathlib's method takes mode first while module-level `io.open` and
+ * friends take the file first. Keyword args other than `mode=` are skipped
+ * so `encoding='latin-1'` can never match.
+ */
+function hasOpenWrite(code) {
+    const re = /(\.)?\bopen\s*\(/g;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+        const dotted = m[1] === ".";
+        let i = m.index + m[0].length;
+        let depth = 1;
+        let quote = null;
+        let cur = "";
+        const args = [];
+        let closed = false;
+        while (i < code.length) {
+            const ch = code[i];
+            if (quote) {
+                cur += ch;
+                if (ch === "\\" && i + 1 < code.length) {
+                    cur += code[i + 1];
+                    i += 2;
+                    continue;
+                }
+                if (ch === quote)
+                    quote = null;
+                i++;
+                continue;
+            }
+            if (ch === '"' || ch === "'") {
+                quote = ch;
+                cur += ch;
+                i++;
+                continue;
+            }
+            if (ch === "(" || ch === "[" || ch === "{") {
+                depth++;
+                cur += ch;
+                i++;
+                continue;
+            }
+            if (ch === ")" || ch === "]" || ch === "}") {
+                if (ch === ")" && depth === 1) {
+                    args.push(cur);
+                    closed = true;
+                    i++;
+                    break;
+                }
+                depth--;
+                cur += ch;
+                i++;
+                continue;
+            }
+            if (ch === "," && depth === 1) {
+                args.push(cur);
+                cur = "";
+                i++;
+                continue;
+            }
+            cur += ch;
+            i++;
+        }
+        if (!closed)
+            continue;
+        const isKwarg = (arg) => /^\s*[A-Za-z_]\w*\s*=/.test(arg);
+        const positional = dotted ? [args[0], args[1]] : [args[1]];
+        for (const arg of positional) {
+            if (arg === undefined || isKwarg(arg))
+                continue;
+            if (hasWriteLiteral(arg))
+                return true;
+        }
+        for (const arg of args) {
+            const kw = /^\s*mode\s*=\s*([\s\S]*?)\s*$/.exec(arg);
+            if (kw && hasWriteLiteral(kw[1]))
+                return true;
+        }
+    }
+    return false;
+}
 const EDIT_INTENT = [
-    { name: "open() in a writing mode", re: /\bopen\s*\(\s*[^)]*?,\s*['"][^'"]*[waxb+][^'"]*['"]/ },
     {
         name: "os.open() with write flags",
         re: /\bos\.open\s*\(\s*[^,]+,[^)]*O_(?:WRONLY|RDWR|CREAT|APPEND|TRUNC)/,
@@ -556,6 +666,8 @@ export function scanCode(code) {
     if (!code.trim())
         return null;
     const normalized = stripConsoleWrites(code);
+    if (hasOpenWrite(normalized))
+        return "open() in a writing mode";
     for (const { name, re } of EDIT_INTENT) {
         if (re.test(normalized))
             return name;
