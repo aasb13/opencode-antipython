@@ -13,10 +13,11 @@ const INSPECTED = {
 };
 const VIA_LABEL = {
     "inline-c": "inline code via -c",
+    "inline-eval": "inline code via -e/--eval/-p",
     "heredoc-stdin": "inline code via heredoc on stdin",
     "pipe-stdin": "inline code piped on stdin",
     "here-string": "inline code via here-string",
-    "generated-script": "a python script generated in the same command",
+    "generated-script": "a script generated in the same command",
     "in-place-sed": "an in-place sed replacement",
 };
 const PYTHON_GUIDANCE = [
@@ -27,6 +28,14 @@ const PYTHON_GUIDANCE = [
     "Running real scripts and module invocations is still allowed: `python3 script.py`,",
     "`python3 -m pytest`, `uv run ...`.",
 ];
+const NODE_GUIDANCE = [
+    "Never write files with Node. The same reasoning as for Python applies: a one-liner",
+    "garbles content, truncates files on failure, and bypasses the edit tool's diff tracking.",
+    "Use the edit tool for surgical changes, the write tool for new or full-file content,",
+    "and shell commands (cp, mv, rm, git checkout) for filesystem-level operations.",
+    "Running real scripts is still allowed: `node script.js`, `bun test`, `bun run build`,",
+    "`node -e \"console.log(process.version)\"`, `node --version`.",
+];
 const SED_GUIDANCE = [
     "Never rewrite a file with `sed -i`. The rewritten content never appears as a diff",
     "you can check, a wrong delimiter or pattern silently leaves the file untouched or",
@@ -34,18 +43,23 @@ const SED_GUIDANCE = [
     "Use the edit tool for surgical changes and the write tool for new or full-file content.",
     "Reading with sed is still allowed: `sed -n '1,20p' f`, `sed 's/x/y/' f | diff - f`.",
 ];
+const RUNTIME_LABEL = {
+    python: "a Python interpreter",
+    node: "a Node.js interpreter",
+};
 function message(tool, v) {
-    const sed = v.via === "in-place-sed";
+    const sed = v.runtime === "sed";
+    const runtime = RUNTIME_LABEL[v.runtime] ?? v.runtime;
     return [
         sed
             ? `antipython: blocked - ${tool} would rewrite files with an in-place sed replacement (${v.reason}).`
-            : `antipython: blocked - ${tool} would modify files through a Python interpreter (${v.reason}).`,
+            : `antipython: blocked - ${tool} would modify files through ${runtime} (${v.reason}).`,
         "",
         `command: ${v.invocation.slice(0, 300)}`,
         `via:    ${VIA_LABEL[v.via] ?? v.via}`,
         `code:   ${v.excerpt}`,
         "",
-        ...(sed ? SED_GUIDANCE : PYTHON_GUIDANCE),
+        ...(sed ? SED_GUIDANCE : v.runtime === "node" ? NODE_GUIDANCE : PYTHON_GUIDANCE),
     ].join("\n");
 }
 export const Antipython = Plugin.define({

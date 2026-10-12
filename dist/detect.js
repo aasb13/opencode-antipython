@@ -1,13 +1,14 @@
 /**
- * antipython - detect attempts to mutate files through a Python interpreter.
+ * antipython - detect attempts to mutate files through an interpreter.
  *
- * The policy: a Python interpreter must never be the thing that writes a file
- * during agent work. Use the edit/write tools instead. What IS allowed is
- * running real Python scripts and normal module invocations (pytest, pip, ...).
+ * The policy: an interpreter must never be the thing that writes a file during
+ * agent work. Use the edit/write tools instead. What IS allowed is running real
+ * scripts and normal module invocations (pytest, pip, node script.js, ...).
  *
- * Pipeline:
+ * Python and Node share the same shape of misuse, so they share the pipeline:
+ *
  *   1. splitCommand  - quote/heredoc aware shell splitter
- *   2. findPython    - locate interpreter invocations in each command segment
+ *   2. findPython/findNode - locate interpreter invocations in each segment
  *   3. classify      - decide whether the payload is a real script, a module
  *                      run, or inline code authored by the model
  *   4. scanCode      - regex edit-intent scan over inline code
@@ -243,6 +244,12 @@ export function isPythonBinary(word) {
         return true;
     return /^python(2|3)?(\.\d{1,2})?$/.test(base);
 }
+const NODE_BASENAMES = new Set(["node", "nodejs", "bun", "bunx", "deno"]);
+/** `eval` is deno's subcommand for evaluating a code string, not a script path */
+const NODE_EVAL_SUBCOMMANDS = new Set(["eval"]);
+export function isNodeBinary(word) {
+    return NODE_BASENAMES.has(basename(word));
+}
 /** subcommands/launchers that may sit in front of the interpreter */
 const RUNNERS = new Set([
     "run",
@@ -265,6 +272,13 @@ const RUNNERS = new Set([
     "pdm",
     "rye",
     "pixi",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "bunx",
+    "deno",
 ]);
 /**
  * Shell control words that may precede a command word. The splitter breaks a
@@ -292,6 +306,44 @@ const CONTROL_WORDS = new Set([
     "not",
     "return",
 ]);
+/** a count/duration value that belongs to a launcher: `timeout 5`, `nice 10` */
+const NUMERIC_VALUE_RE = /^\d+(?:\.\d+)?[smhd]?$/i;
+/**
+ * Must every word before the interpreter be a benign prefix for it to be the
+ * command actually being run?
+ *
+ * Benign means: a runner (`sudo`, `uv run`, `npm exec`), an env assignment, a
+ * shell control word, or an option together with its value (`sudo -u deploy`,
+ * `timeout -s KILL 5`). A bare word with no flag or runner in front of it means
+ * something else owns the pipeline, so what follows is its argument, not a
+ * command: `echo python3 -c "..."` is text being printed.
+ */
+export function benignPrefix(argv, index) {
+    let expectValue = false;
+    for (let j = 0; j < index; j++) {
+        const prev = argv[j];
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(prev))
+            continue;
+        if (RUNNERS.has(basename(prev)) || RUNNERS.has(prev))
+            continue;
+        if (CONTROL_WORDS.has(prev))
+            continue;
+        if (prev === "--")
+            continue;
+        if (prev.startsWith("-")) {
+            expectValue = true;
+            continue;
+        }
+        if (expectValue) {
+            expectValue = false;
+            continue;
+        }
+        if (NUMERIC_VALUE_RE.test(prev))
+            continue;
+        return false;
+    }
+    return true;
+}
 export function findPythonIndex(argv) {
     for (let i = 0; i < argv.length; i++) {
         const word = argv[i];
@@ -299,28 +351,63 @@ export function findPythonIndex(argv) {
             continue;
         if (!isPythonBinary(word))
             continue;
-        // everything before the interpreter must be a benign prefix
-        let ok = true;
-        for (let j = 0; j < i; j++) {
-            const prev = argv[j];
-            if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(prev))
-                continue;
-            if (RUNNERS.has(basename(prev)) || RUNNERS.has(prev))
-                continue;
-            if (/^-(?:[a-z]*n)?\d+$/.test(prev))
-                continue;
-            if (prev === "--")
-                continue;
-            if (CONTROL_WORDS.has(prev))
-                continue;
-            ok = false;
-            break;
-        }
-        if (ok)
+        if (benignPrefix(argv, i))
             return i;
     }
     return -1;
 }
+/**
+ * index of a node invocation, or -1. Same benign-prefix rule as
+ * findPythonIndex: `npm exec -- node -e ...` must still be recognised, so the
+ * runner words have been added to RUNNERS.
+ */
+export function findNodeIndex(argv) {
+    for (let i = 0; i < argv.length; i++) {
+        const word = argv[i];
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word))
+            continue;
+        if (!isNodeBinary(word))
+            continue;
+        if (!benignPrefix(argv, i))
+            continue;
+        // `bun run node -e ...`: the first node-family word is only a launcher
+        // here, so a real interpreter further along owns the payload instead.
+        const next = argv[i + 1];
+        if (next !== undefined &&
+            (RUNNERS.has(basename(next)) || RUNNERS.has(next)) &&
+            argv.slice(i + 2).some((w) => isNodeBinary(w))) {
+            continue;
+        }
+        return i;
+    }
+    return -1;
+}
+/** node/bun flags whose argument is the code to evaluate */
+const NODE_EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
+/** node/bun flags whose value is the next argv entry, not a script path */
+const NODE_VALUED_FLAGS = new Set([
+    "-r",
+    "--require",
+    "-C",
+    "--conditions",
+    "--env-file",
+    "--input-type",
+    "--loader",
+    "--experimental-loader",
+    "--title",
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--stack-size",
+    "--cpu-prof-dir",
+    "--heap-prof-dir",
+    "--diagnostic-dir",
+    "--report-dir",
+    "--redirect-warnings",
+    "--snapshot-blob",
+    "--policy-integrity",
+]);
+/** script extensions a node-family runtime executes directly */
+const NODE_SCRIPT_RE = /\.(?:js|mjs|cjs|jsx|ts|mts|cts)$/i;
 const SED_BASENAMES = new Set(["sed", "gsed"]);
 /**
  * launchers that hand the rest of their argv to sed: `xargs`, and the find
@@ -401,12 +488,12 @@ function findInPlaceFlag(argv) {
     }
     return null;
 }
-/** .py files the shell part of the command creates, with their inline content */
+/** script files the shell part of the command creates, with their inline content */
 function collectCreatedFiles(segments) {
     const created = new Map();
     const record = (path, content) => {
         const target = path.replace(/^["']|["']$/g, "").trim();
-        if (!target || !/\.pyw?$/i.test(target))
+        if (!target || !/\.(?:pyw?|js|mjs|cjs|ts|mts|cts)$/i.test(target))
             return;
         const key = target.replace(/^\.\//, "");
         if (!created.has(key))
@@ -504,12 +591,161 @@ function classify(segment, created, producer) {
 function looksLikePython(code) {
     return /\b(?:import|from)\s+\w|def\s+\w+\s*\(|print\s*\(|\bopen\s*\(|\w+\s*=/.test(code);
 }
+/** Does the piped-in text look like a javascript program? */
+function looksLikeJS(code) {
+    return (/\b(?:require|import|export|const|let|var|function|class|async|await|return|console|process|module|Deno)\b|=>|\.\w+\s*\(/.test(code));
+}
 function stripQuotes(word) {
     const first = word[0];
     if ((first === '"' || first === "'") && word.length > 1 && word.endsWith(first)) {
         return word.slice(1, -1);
     }
     return word;
+}
+/**
+ * Calls that mutate the filesystem.
+ *
+ * The write family is matched at identifier level, not call level: `fs['writeFileSync'](...)`
+ * and `const w = fs.writeFileSync; w(...)` are the same act, and those identifiers
+ * essentially never appear in javascript that does not write a file. Everything
+ * else stays call-shaped, because a bare `rm` inside a string is not a deletion.
+ */
+const JS_MUTATIONS = [
+    {
+        name: "fs write call (writeFile/appendFile/writeFileSync/createWriteStream)",
+        re: /\b(?:writeFileSync|appendFileSync|writeFile|appendFile|createWriteStream)\b/,
+    },
+    {
+        name: "fs removal (unlink/rm/rmdir)",
+        re: /\b(?:fs|fsp|fs\.promises|fsExtra)\s*\.\s*(?:unlink|rm|rmdir|unlinkSync|rmSync|rmdirSync)\s*\(/,
+    },
+    { name: "destructured fs removal (unlinkSync/rmSync/rmdirSync)", re: /\b(?:unlinkSync|rmSync|rmdirSync)\s*\(/ },
+    {
+        name: "fs copy/rename (copyFile/rename/cp)",
+        re: /\b(?:fs|fsp|fs\.promises|fsExtra)\s*\.\s*(?:copyFile|rename|cp|copyFileSync|renameSync|cpSync)\s*\(/,
+    },
+    {
+        name: "destructured fs copy/rename (copyFileSync/renameSync)",
+        re: /\b(?:copyFileSync|renameSync|cpSync)\s*\(/,
+    },
+    {
+        name: "fs directory mutation (mkdir/mkdtemp)",
+        re: /\b(?:fs|fsp|fs\.promises|fsExtra)\s*\.\s*(?:mkdir|mkdtemp|mkdirSync|mkdtempSync|ensureDirSync)\s*\(/,
+    },
+    { name: "destructured fs directory mutation (mkdirSync/mkdtempSync)", re: /\b(?:mkdirSync|mkdtempSync)\s*\(/ },
+    {
+        name: "fs metadata mutation (chmod/chown/truncate/link/symlink/utimes)",
+        re: /\b(?:fs|fsp|fs\.promises|fsExtra)\s*\.\s*(?:chmod|chown|lchown|fchmod|fchown|truncate|ftruncate|utimes|futimes|link|symlink|chmodSync|chownSync|lchownSync|fchmodSync|fchownSync|truncateSync|ftruncateSync|utimesSync|futimesSync|linkSync|symlinkSync)\s*\(/,
+    },
+    {
+        name: "destructured fs metadata mutation",
+        re: /\b(?:chmodSync|chownSync|lchownSync|fchmodSync|fchownSync|truncateSync|ftruncateSync|utimesSync|futimesSync|linkSync|symlinkSync)\s*\(/,
+    },
+    {
+        name: "Deno filesystem mutation",
+        re: /\bDeno\s*\.\s*(?:writeFile|writeTextFile|writeFileSync|writeTextFileSync|remove|removeSync|mkdir|mkdirSync|rename|renameSync|copyFile|copyFileSync|chmod|chmodSync|truncate|truncateSync|symlink|symlinkSync)\s*\(/,
+    },
+    { name: "fs.open() with a write flag (O_WRONLY/O_CREAT/...)", re: /\bO_(?:WRONLY|RDWR|CREAT|APPEND|TRUNC)\b/ },
+];
+const JS_PROCESS_RE = /\b(?:execSync|execFileSync|spawnSync|fork|spawn)\s*\(|\b(?:child_process|node:child_process)\s*\.\s*(?:exec|execFile|spawn|execSync|execFileSync|spawnSync)\s*\(/;
+/** shell words that change the filesystem; `>`/`>>` only when not part of `=>` or `>=` */
+const JS_MUTATOR_RE = /\b(?:rm|rmdir|mv|cp|dd|truncate|chmod|chown|chgrp|unlink|touch|install|shred|tee)\b|\bsed\b[^)]*-i\b|\btar\s+-x|\bgit\s+(?:apply|checkout|reset|clean)\b|(?:^|[^=])>>?(?![=>])/;
+/**
+ * Edit-intent scan over javascript code.
+ *
+ * The write family is matched at identifier level, not call level: `fs['writeFileSync'](...)`
+ * and `const w = fs.writeFileSync; w(...)` are the same act, and those identifiers
+ * essentially never appear in javascript that does not write a file. Everything
+ * else stays call-shaped, because a bare `rm` inside a string is not a deletion.
+ */
+export function scanNodeCode(code) {
+    if (!code.trim())
+        return null;
+    if (hasOpenWrite(code))
+        return "fs.open() in a writing mode";
+    for (const { name, re } of JS_MUTATIONS) {
+        if (re.test(code))
+            return name;
+    }
+    const collapsed = code.replace(/(['"])\s*,\s*\1/g, ",");
+    if (JS_PROCESS_RE.test(collapsed) && JS_MUTATOR_RE.test(collapsed)) {
+        return "shelling out to a mutating command";
+    }
+    return null;
+}
+/**
+ * Decide whether the payload of a node invocation is inline code authored by
+ * the model, or a real script the model is allowed to run.
+ */
+function classifyNode(segment, created, producer) {
+    const index = findNodeIndex(segment.argv);
+    if (index < 0)
+        return { kind: "allow", why: "no interpreter" };
+    const args = segment.argv.slice(index + 1);
+    let sawStdinRedirect = false;
+    for (let k = 0; k < args.length; k++) {
+        const token = stripQuotes(args[k]);
+        if (NODE_EVAL_FLAGS.has(token)) {
+            return { kind: "inline", code: stripQuotes(args[k + 1] ?? ""), via: "inline-eval" };
+        }
+        if (token.startsWith("--eval=")) {
+            return { kind: "inline", code: stripQuotes(token.slice("--eval=".length)), via: "inline-eval" };
+        }
+        if (token.startsWith("--print=")) {
+            return { kind: "inline", code: stripQuotes(token.slice("--print=".length)), via: "inline-eval" };
+        }
+        if (/^-[ep].+/.test(token)) {
+            return { kind: "inline", code: stripQuotes(token.slice(2)), via: "inline-eval" };
+        }
+        if (token.startsWith("--") && token.includes("="))
+            continue;
+        if (NODE_VALUED_FLAGS.has(token)) {
+            k++;
+            continue;
+        }
+        if (token === "-") {
+            sawStdinRedirect = true;
+            continue;
+        }
+        if (token.startsWith("-"))
+            continue;
+        // `deno eval <code>` is deno's evaluate subcommand, not a script path
+        if (NODE_EVAL_SUBCOMMANDS.has(token) && basename(segment.argv[index]) === "deno") {
+            const value = args.slice(k + 1).find((t) => !t.startsWith("-"));
+            if (value === undefined)
+                return { kind: "allow", why: "eval without a code argument" };
+            return { kind: "inline", code: stripQuotes(value), via: "inline-eval" };
+        }
+        // first positional argument: a real script file
+        if (NODE_SCRIPT_RE.test(token)) {
+            const key = token.replace(/^\.\//, "");
+            const base = key.split("/").pop();
+            const authored = created.get(key) ?? created.get(base);
+            if (authored && authored.content.trim()) {
+                return { kind: "inline", code: authored.content, via: "generated-script" };
+            }
+        }
+        return { kind: "allow", why: "real script file" };
+    }
+    const hereString = segment.redirects.find((r) => r.op === "<<<");
+    if (hereString) {
+        return { kind: "inline", code: stripQuotes(hereString.target), via: "here-string" };
+    }
+    const heredoc = segment.heredocs[0];
+    if (heredoc) {
+        return { kind: "inline", code: heredoc.body, via: "heredoc-stdin" };
+    }
+    if (segment.piped && producer) {
+        const piped = producer.argv.join(" ");
+        if (looksLikeJS(piped)) {
+            return { kind: "inline", code: piped, via: "pipe-stdin" };
+        }
+        return { kind: "allow", why: "piped input is not a javascript program" };
+    }
+    if (sawStdinRedirect) {
+        return { kind: "allow", why: "stdin redirected from an existing file" };
+    }
+    return { kind: "allow", why: "no inline code" };
 }
 /**
  * Does a file-mode string grant write access? Only `w`, `x`, `a` and `+`
@@ -547,7 +783,7 @@ function hasWriteLiteral(text) {
  * so `encoding='latin-1'` can never match.
  */
 function hasOpenWrite(code) {
-    const re = /(\.)?\bopen\s*\(/g;
+    const re = /(\.)?\b(?:open|openSync)\s*\(/g;
     let m;
     while ((m = re.exec(code)) !== null) {
         const dotted = m[1] === ".";
@@ -692,7 +928,8 @@ export function detect(command) {
         return null;
     const mentionsPython = /python|\bpy\b|pypy/i.test(command);
     const mentionsSed = /\b(?:g?sed)\b/i.test(command);
-    if (!mentionsPython && !mentionsSed)
+    const mentionsNode = /\b(?:node|nodejs|bun|bunx|deno)\b/i.test(command);
+    if (!mentionsPython && !mentionsSed && !mentionsNode)
         return null;
     const segments = splitCommand(command);
     if (mentionsSed) {
@@ -703,15 +940,36 @@ export function detect(command) {
             const invocation = segment.raw || segment.argv.join(" ");
             return {
                 reason: `in-place replacement (${flag})`,
+                runtime: "sed",
                 invocation,
                 excerpt: excerpt(invocation),
                 via: "in-place-sed",
             };
         }
     }
+    const created = collectCreatedFiles(segments);
+    if (mentionsNode) {
+        for (let i = 0; i < segments.length; i++) {
+            const segment = segments[i];
+            if (findNodeIndex(segment.argv) < 0)
+                continue;
+            const payload = classifyNode(segment, created, segments[i - 1]);
+            if (payload.kind === "allow")
+                continue;
+            const reason = scanNodeCode(payload.code);
+            if (!reason)
+                continue;
+            return {
+                reason,
+                runtime: "node",
+                invocation: segment.raw || segment.argv.join(" "),
+                excerpt: excerpt(payload.code),
+                via: payload.via,
+            };
+        }
+    }
     if (!mentionsPython)
         return null;
-    const created = collectCreatedFiles(segments);
     for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         if (findPythonIndex(segment.argv) < 0)
@@ -724,6 +982,7 @@ export function detect(command) {
             continue;
         return {
             reason,
+            runtime: "python",
             invocation: segment.raw || segment.argv.join(" "),
             excerpt: excerpt(payload.code),
             via: payload.via,

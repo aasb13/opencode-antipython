@@ -22,10 +22,17 @@ const fire = (tool, input) =>
 const cases = [
   ["shell", { command: `python3 -c "open('/tmp/x.txt','w').write('pwned')"` }, "BLOCK (inline -c write)"],
   ["shell", { command: `cat > f.py <<'EOF'\nopen('a.txt','w').write('x')\nEOF\npython3 f.py` }, "BLOCK (generated script)"],
+  ["shell", { command: `node -e "require('fs').writeFileSync('a.txt','pwned')"` }, "BLOCK (node -e write)"],
+  ["shell", { command: `node <<'JS'\nfs.writeFileSync('a.txt','pwned')\nJS` }, "BLOCK (node heredoc)"],
+  ["shell", { command: `printf "fs.writeFileSync('a','x')" | node` }, "BLOCK (node pipe stdin)"],
+  ["shell", { command: `node script.js` }, "ALLOW (real node script)"],
+  ["shell", { command: `node -e "console.log(process.version)"` }, "ALLOW (node read only)"],
   ["shell", { command: `python3 -m pytest tests/` }, "ALLOW (module run)"],
   ["shell", { command: `python3 scripts/real.py` }, "ALLOW (real script)"],
   ["shell", { command: `python3 -c "print(open('f.txt').read())"` }, "ALLOW (read only)"],
   ["shell", { command: `ls -la && git status` }, "ALLOW (no python)"],
+  ["shell", { command: `sed -i 's/a/b/' src/app.ts` }, "BLOCK (in-place sed)"],
+  ["shell", { command: `sed -n '1,20p' src/app.ts` }, "ALLOW (sed read only)"],
   ["term_host_exec", { command: `python3 -c "import os; os.remove('z')"` }, "BLOCK (term host_exec)"],
   ["read", { filePath: "/etc/hosts" }, "ALLOW (unrelated tool)"],
 ]
