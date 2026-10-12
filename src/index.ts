@@ -2,15 +2,22 @@ import { Plugin } from "@opencode/plugin"
 import { detect, type Violation } from "./detect.js"
 
 /**
- * tools whose command string we inspect, and the arg that holds it.
+ * Do NOT gate on tool names.
  *
- * NOTE: OpenCode V2 renamed the built-in `bash` tool to `shell`
- * (V1 permission action `bash` -> V2 `shell`). The tool id is `shell` in V2.
+ * The guard used to allowlist `shell`, `term_host_exec` and `term_pty_exec` by
+ * name. Any tool alias defeated that entirely: `opencode-aliases` registers a
+ * `bash` tool that forwards to `shell`, so the hook fires with
+ * `event.tool === "bash"`, misses the allowlist, and returns early — the
+ * detector never sees the command. The same applies to any future rename or
+ * wrapper plugin.
+ *
+ * The payload is identified by its input shape instead: a tool carrying a
+ * non-empty `command` string is a shell, whatever it is called.
  */
-const INSPECTED: Record<string, string> = {
-  shell: "command",
-  term_host_exec: "command",
-  term_pty_exec: "command",
+function commandOf(input: unknown): string | null {
+  if (!input || typeof input !== "object") return null
+  const command = (input as Record<string, unknown>).command
+  return typeof command === "string" && command.length > 0 ? command : null
 }
 
 const VIA_LABEL: Record<string, string> = {
@@ -76,11 +83,8 @@ export const Antipython = Plugin.define({
     console.log(`antipython loaded for ${ctx.location.directory} (opencode ${ctx.app.version})`)
 
     await ctx.tool.hook("execute.before", (event) => {
-      const argKey = INSPECTED[event.tool]
-      if (!argKey) return
-
-      const command = (event.input as Record<string, unknown> | undefined)?.[argKey]
-      if (typeof command !== "string" || command.length === 0) return
+      const command = commandOf(event.input)
+      if (command === null) return
 
       const violation = detect(command)
       if (!violation) return

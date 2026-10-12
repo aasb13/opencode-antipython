@@ -25,6 +25,14 @@ const cases = [
   ["shell", { command: `node -e "require('fs').writeFileSync('a.txt','pwned')"` }, "BLOCK (node -e write)"],
   ["shell", { command: `node <<'JS'\nfs.writeFileSync('a.txt','pwned')\nJS` }, "BLOCK (node heredoc)"],
   ["shell", { command: `printf "fs.writeFileSync('a','x')" | node` }, "BLOCK (node pipe stdin)"],
+  ["bash", { command: `python3 -c "open('/tmp/x.txt','w').write('pwned')"` }, "BLOCK (alias tool name)"],
+  ["bash", { command: `python3 - <<'PY'\nimport pathlib\npathlib.Path('AGENTS.md').write_text('x')\nPY` }, "BLOCK (alias heredoc pathlib write)"],
+  ["bash", { command: `node -e "require('fs').writeFileSync('a.txt','pwned')"` }, "BLOCK (alias node)"],
+  ["bash", { command: `python3 -m pytest -q` }, "ALLOW (alias module run)"],
+  ["my-shell-2", { command: `python3 -c "import os; os.remove('z')"` }, "BLOCK (unknown tool carrying a command)"],
+  ["weird_tool", { command: `python3 -m pytest` }, "ALLOW (unknown tool, benign payload)"],
+  ["read", { filePath: "/etc/hosts" }, "ALLOW (no command field)"],
+  ["shell", { command: `` }, "ALLOW (empty command)"],
   ["shell", { command: `node script.js` }, "ALLOW (real node script)"],
   ["shell", { command: `node -e "console.log(process.version)"` }, "ALLOW (node read only)"],
   ["shell", { command: `python3 -m pytest tests/` }, "ALLOW (module run)"],
@@ -34,7 +42,6 @@ const cases = [
   ["shell", { command: `sed -i 's/a/b/' src/app.ts` }, "BLOCK (in-place sed)"],
   ["shell", { command: `sed -n '1,20p' src/app.ts` }, "ALLOW (sed read only)"],
   ["term_host_exec", { command: `python3 -c "import os; os.remove('z')"` }, "BLOCK (term host_exec)"],
-  ["read", { filePath: "/etc/hosts" }, "ALLOW (unrelated tool)"],
 ]
 
 let pass = 0,
